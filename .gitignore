@@ -1,0 +1,35 @@
+# Maven
+backend/target/
+backend/.mvn/
+*.class
+*.jar
+*.war
+
+# IDE
+.idea/
+*.iml
+.vscode/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+
+# Node
+frontend/node_modules/
+frontend/dist/
+frontend/.env
+
+# Backend env
+backend/.env
+backend/src/main/resources/application-local.properties
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Quartz / temp
+tokens/
