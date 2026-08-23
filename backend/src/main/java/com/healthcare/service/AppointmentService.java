@@ -32,6 +32,9 @@ public class AppointmentService {
     private final EmailService emailService;
     private final GoogleCalendarService calendarService;
 
+    private static final List<AppointmentStatus> CANCELLED_STATUSES =
+            List.of(AppointmentStatus.CANCELLED, AppointmentStatus.CANCELLED_DOCTOR_LEAVE);
+
     @Value("${app.scheduler.slot-hold-expiry-minutes:10}")
     private int slotHoldExpiryMinutes;
 
@@ -48,16 +51,13 @@ public class AppointmentService {
                     .doctorId(doctorId).date(date).availableSlots(List.of()).build();
         }
 
-        // All slots for the day
         List<LocalTime> allSlots = generateSlots(
                 doctor.getWorkStartTime(), doctor.getWorkEndTime(), doctor.getSlotDurationMinutes());
 
-        // Booked slots
         Set<LocalTime> bookedTimes = appointmentRepository
                 .findConfirmedByDoctorAndDate(doctorId, date)
                 .stream().map(Appointment::getSlotStartTime).collect(Collectors.toSet());
 
-        // Held slots
         Set<LocalTime> heldTimes = slotHoldRepository
                 .findActiveHoldsByDoctorAndDate(doctorId, date, LocalDateTime.now())
                 .stream().map(SlotHold::getSlotStartTime).collect(Collectors.toSet());
@@ -75,14 +75,9 @@ public class AppointmentService {
     }
 
     // ---------------------------------------------------------------
-    // Slot hold — step 1 of booking flow
+    // Slot hold
     // ---------------------------------------------------------------
 
-    /**
-     * Acquires a temporary hold on a slot (max {@code slotHoldExpiryMinutes}).
-     * Uses a DB-level unique constraint on (doctor_id, hold_date, slot_start_time)
-     * to prevent two patients from holding the same slot simultaneously.
-     */
     @Transactional
     public SlotHold holdSlot(Long patientUserId, SlotHoldRequest req) {
         Doctor doctor = doctorRepository.findById(req.getDoctorId())
@@ -91,19 +86,18 @@ public class AppointmentService {
         Patient patient = patientRepository.findByUserId(patientUserId)
                 .orElseThrow(() -> new ResourceNotFoundException("Patient profile not found for current user"));
 
-        // Doctor on leave?
         if (doctorLeaveRepository.existsByDoctorIdAndLeaveDate(req.getDoctorId(), req.getAppointmentDate())) {
             throw new SlotUnavailableException("Doctor is on leave on " + req.getAppointmentDate());
         }
 
-        // Already confirmed/pending appointment for this slot?
-        boolean slotTaken = appointmentRepository.existsByDoctorIdAndAppointmentDateAndSlotStartTimeAndStatusNotIn(
-                req.getDoctorId(), req.getAppointmentDate(), req.getSlotStartTime(),
-                List.of(AppointmentStatus.CANCELLED, AppointmentStatus.CANCELLED_DOCTOR_LEAVE,
-                        AppointmentStatus.SLOT_HELD));
+        // Check slot not already booked (exclude cancelled)
+        boolean slotTaken = appointmentRepository
+                .existsByDoctorIdAndAppointmentDateAndSlotStartTimeAndStatusNotIn(
+                        req.getDoctorId(), req.getAppointmentDate(), req.getSlotStartTime(),
+                        List.of(AppointmentStatus.CANCELLED, AppointmentStatus.CANCELLED_DOCTOR_LEAVE,
+                                AppointmentStatus.SLOT_HELD));
         if (slotTaken) throw new SlotUnavailableException("This slot is already booked");
 
-        // Active hold by another patient?
         if (slotHoldRepository.existsActiveHold(req.getDoctorId(), req.getAppointmentDate(),
                 req.getSlotStartTime(), LocalDateTime.now())) {
             throw new SlotUnavailableException("This slot is temporarily held by another patient");
@@ -124,26 +118,21 @@ public class AppointmentService {
         try {
             return slotHoldRepository.save(hold);
         } catch (Exception e) {
-            // Unique constraint violation — another concurrent request grabbed it first
             throw new SlotUnavailableException("This slot was just taken. Please choose another.");
         }
     }
 
     // ---------------------------------------------------------------
-    // Confirm booking — step 2, after symptom form is submitted
+    // Confirm booking — converts hold → Appointment
     // ---------------------------------------------------------------
 
-    /**
-     * Converts a slot hold into a confirmed Appointment.
-     * Uses PESSIMISTIC_WRITE lock on the target slot to guarantee no double-booking.
-     */
     @Transactional
     public Appointment confirmBooking(Long patientUserId, Long holdId) {
         Patient patient = patientRepository.findByUserId(patientUserId)
                 .orElseThrow(() -> new ResourceNotFoundException("Patient profile not found"));
 
         SlotHold hold = slotHoldRepository.findById(holdId)
-                .orElseThrow(() -> new ResourceNotFoundException("Slot hold", holdId));
+                .orElseThrow(() -> new ResourceNotFoundException("Slot hold expired or not found. Please book again."));
 
         if (!hold.getPatient().getId().equals(patient.getId())) {
             throw new UnauthorizedException("This slot hold does not belong to you");
@@ -153,9 +142,10 @@ public class AppointmentService {
             throw new SlotUnavailableException("Your slot hold has expired. Please start over.");
         }
 
-        // Final double-booking guard with pessimistic lock
+        // Final double-booking guard — pass excluded statuses as parameter
         appointmentRepository.findActiveSlotWithLock(
-                hold.getDoctor().getId(), hold.getHoldDate(), hold.getSlotStartTime())
+                hold.getDoctor().getId(), hold.getHoldDate(),
+                hold.getSlotStartTime(), CANCELLED_STATUSES)
                 .ifPresent(a -> { throw new SlotUnavailableException("Slot was just booked by someone else"); });
 
         Doctor doctor = hold.getDoctor();
@@ -173,20 +163,14 @@ public class AppointmentService {
         appointment = appointmentRepository.save(appointment);
         slotHoldRepository.delete(hold);
 
-        // Fire-and-forget: email + calendar (failures must not roll back the booking)
-        try {
-            emailService.sendBookingConfirmation(appointment);
-        } catch (Exception e) {
-            log.error("Booking confirmation email failed for appointment {}: {}", appointment.getId(), e.getMessage());
-        }
-        try {
-            calendarService.createAppointmentEvent(appointment);
-            appointmentRepository.save(appointment); // persist calendar event IDs
-        } catch (Exception e) {
-            log.error("Calendar event creation failed for appointment {}: {}", appointment.getId(), e.getMessage());
-        }
+        // Safely send email — never let email failure crash the booking
+        final Appointment saved = appointment;
+        new Thread(() -> {
+            try { emailService.sendBookingConfirmation(saved); }
+            catch (Exception e) { log.error("Booking email failed [appt={}]: {}", saved.getId(), e.getMessage()); }
+        }).start();
 
-        log.info("Appointment {} confirmed for patient {} with doctor {} on {}",
+        log.info("Appointment {} booked: patient={} doctor={} date={}",
                 appointment.getId(), patient.getId(), doctor.getId(), appointment.getAppointmentDate());
         return appointment;
     }
@@ -200,9 +184,8 @@ public class AppointmentService {
         Appointment appt = appointmentRepository.findById(appointmentId)
                 .orElseThrow(() -> new ResourceNotFoundException("Appointment", appointmentId));
 
-        // Only patient, the appointment's doctor, or admin can cancel
         boolean isPatient = appt.getPatient().getUser().getId().equals(requestingUserId);
-        boolean isDoctor = appt.getDoctor().getUser().getId().equals(requestingUserId);
+        boolean isDoctor  = appt.getDoctor().getUser().getId().equals(requestingUserId);
         if (!isPatient && !isDoctor) {
             throw new UnauthorizedException("You are not authorised to cancel this appointment");
         }
@@ -216,12 +199,15 @@ public class AppointmentService {
         appt.setCancellationReason(reason);
         appt = appointmentRepository.save(appt);
 
-        try { emailService.sendCancellationNotice(appt, reason); } catch (Exception e) {
-            log.error("Cancellation email failed: {}", e.getMessage());
-        }
-        try { calendarService.deleteAppointmentEvent(appt); } catch (Exception e) {
-            log.error("Calendar delete failed: {}", e.getMessage());
-        }
+        final Appointment cancelled = appt;
+        new Thread(() -> {
+            try { emailService.sendCancellationNotice(cancelled, reason); }
+            catch (Exception e) { log.error("Cancellation email failed: {}", e.getMessage()); }
+        }).start();
+
+        try { calendarService.deleteAppointmentEvent(appt); }
+        catch (Exception e) { log.error("Calendar delete failed: {}", e.getMessage()); }
+
         return appt;
     }
 
@@ -243,27 +229,30 @@ public class AppointmentService {
             throw new BadRequestException("Cannot reschedule an appointment with status: " + appt.getStatus());
         }
 
-        // Check new slot availability
         if (doctorLeaveRepository.existsByDoctorIdAndLeaveDate(appt.getDoctor().getId(), req.getNewDate())) {
             throw new SlotUnavailableException("Doctor is on leave on " + req.getNewDate());
         }
+
         appointmentRepository.findActiveSlotWithLock(
-                appt.getDoctor().getId(), req.getNewDate(), req.getNewSlotStartTime())
+                appt.getDoctor().getId(), req.getNewDate(),
+                req.getNewSlotStartTime(), CANCELLED_STATUSES)
                 .ifPresent(a -> { throw new SlotUnavailableException("The new slot is already booked"); });
 
         LocalTime newEnd = req.getNewSlotStartTime().plusMinutes(appt.getDoctor().getSlotDurationMinutes());
-
         appt.setAppointmentDate(req.getNewDate());
         appt.setSlotStartTime(req.getNewSlotStartTime());
         appt.setSlotEndTime(newEnd);
         appt = appointmentRepository.save(appt);
 
-        try { emailService.sendBookingConfirmation(appt); } catch (Exception e) {
-            log.error("Reschedule email failed: {}", e.getMessage());
-        }
-        try { calendarService.updateAppointmentEvent(appt); } catch (Exception e) {
-            log.error("Calendar update failed: {}", e.getMessage());
-        }
+        final Appointment rescheduled = appt;
+        new Thread(() -> {
+            try { emailService.sendBookingConfirmation(rescheduled); }
+            catch (Exception e) { log.error("Reschedule email failed: {}", e.getMessage()); }
+        }).start();
+
+        try { calendarService.updateAppointmentEvent(appt); }
+        catch (Exception e) { log.error("Calendar update failed: {}", e.getMessage()); }
+
         return appt;
     }
 
@@ -289,7 +278,7 @@ public class AppointmentService {
     }
 
     // ---------------------------------------------------------------
-    // Helpers
+    // Helper
     // ---------------------------------------------------------------
 
     private List<LocalTime> generateSlots(LocalTime start, LocalTime end, int durationMinutes) {

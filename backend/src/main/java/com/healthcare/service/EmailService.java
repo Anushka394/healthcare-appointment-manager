@@ -127,10 +127,11 @@ public class EmailService {
                 .status(NotificationStatus.PENDING)
                 .build();
         notificationRepository.save(notification);
-        doSend(notification);
+        // Send in background thread so email failure never crashes caller
+        final Notification saved = notification;
+        new Thread(() -> doSend(saved)).start();
     }
 
-    @Async("asyncExecutor")
     public void doSend(Notification notification) {
         notification.setLastAttemptAt(LocalDateTime.now());
         notification.setRetryCount(notification.getRetryCount() + 1);

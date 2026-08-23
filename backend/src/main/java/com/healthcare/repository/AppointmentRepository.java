@@ -27,10 +27,11 @@ public interface AppointmentRepository extends JpaRepository<Appointment, Long> 
     @Lock(LockModeType.PESSIMISTIC_WRITE)
     @Query("SELECT a FROM Appointment a WHERE a.doctor.id = :doctorId " +
            "AND a.appointmentDate = :date AND a.slotStartTime = :slotTime " +
-           "AND a.status NOT IN ('CANCELLED', 'CANCELLED_DOCTOR_LEAVE')")
+           "AND a.status NOT IN :excludedStatuses")
     Optional<Appointment> findActiveSlotWithLock(@Param("doctorId") Long doctorId,
                                                   @Param("date") LocalDate date,
-                                                  @Param("slotTime") LocalTime slotTime);
+                                                  @Param("slotTime") LocalTime slotTime,
+                                                  @Param("excludedStatuses") List<AppointmentStatus> excludedStatuses);
 
     @Query("SELECT a FROM Appointment a WHERE a.doctor.id = :doctorId " +
            "AND a.appointmentDate = :date " +

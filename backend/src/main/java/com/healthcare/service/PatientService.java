@@ -5,10 +5,7 @@ import com.healthcare.dto.patient.PatientResponse;
 import com.healthcare.dto.symptom.SymptomFormRequest;
 import com.healthcare.dto.symptom.SymptomFormResponse;
 import com.healthcare.entity.*;
-import com.healthcare.exception.BadRequestException;
-import com.healthcare.exception.DuplicateResourceException;
-import com.healthcare.exception.ResourceNotFoundException;
-import com.healthcare.exception.UnauthorizedException;
+import com.healthcare.exception.*;
 import com.healthcare.repository.*;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -39,24 +36,19 @@ public class PatientService {
     public PatientResponse updateMyProfile(Long userId, PatientRequest req) {
         Patient patient = patientRepository.findByUserId(userId)
                 .orElseThrow(() -> new ResourceNotFoundException("Patient profile not found"));
-        if (req.getDateOfBirth() != null) patient.setDateOfBirth(req.getDateOfBirth());
-        if (req.getGender() != null) patient.setGender(req.getGender());
-        if (req.getBloodGroup() != null) patient.setBloodGroup(req.getBloodGroup());
-        if (req.getAllergies() != null) patient.setAllergies(req.getAllergies());
-        if (req.getEmergencyContactName() != null) patient.setEmergencyContactName(req.getEmergencyContactName());
+        if (req.getDateOfBirth() != null)          patient.setDateOfBirth(req.getDateOfBirth());
+        if (req.getGender() != null)               patient.setGender(req.getGender());
+        if (req.getBloodGroup() != null)            patient.setBloodGroup(req.getBloodGroup());
+        if (req.getAllergies() != null)             patient.setAllergies(req.getAllergies());
+        if (req.getEmergencyContactName() != null)  patient.setEmergencyContactName(req.getEmergencyContactName());
         if (req.getEmergencyContactPhone() != null) patient.setEmergencyContactPhone(req.getEmergencyContactPhone());
         return toResponse(patientRepository.save(patient));
     }
 
     // ---------------------------------------------------------------
-    // Symptom form — submitted after slot hold, before booking is confirmed
+    // Symptom form
     // ---------------------------------------------------------------
 
-    /**
-     * Submits symptom form for a held appointment slot.
-     * Triggers LLM to generate pre-visit summary.
-     * Status transitions: PENDING_SYMPTOMS → (stays until confirmBooking called)
-     */
     @Transactional
     public SymptomFormResponse submitSymptomForm(Long userId, Long appointmentId, SymptomFormRequest req) {
         Patient patient = patientRepository.findByUserId(userId)
@@ -68,15 +60,21 @@ public class PatientService {
         if (!appt.getPatient().getId().equals(patient.getId())) {
             throw new UnauthorizedException("This appointment does not belong to you");
         }
-        if (appt.getStatus() != Appointment.AppointmentStatus.PENDING_SYMPTOMS
-                && appt.getStatus() != Appointment.AppointmentStatus.SLOT_HELD) {
-            throw new BadRequestException("Symptom form can only be submitted for pending appointments");
-        }
-        if (symptomFormRepository.existsByAppointmentId(appointmentId)) {
-            throw new DuplicateResourceException("Symptom form already submitted for this appointment");
+
+        // Accept any non-completed, non-cancelled status
+        Appointment.AppointmentStatus status = appt.getStatus();
+        if (status == Appointment.AppointmentStatus.COMPLETED
+                || status == Appointment.AppointmentStatus.CANCELLED
+                || status == Appointment.AppointmentStatus.CANCELLED_DOCTOR_LEAVE) {
+            throw new BadRequestException("Cannot submit symptom form for appointment with status: " + status);
         }
 
-        // Call LLM — graceful fallback if it fails
+        // If already submitted, just return existing
+        if (symptomFormRepository.existsByAppointmentId(appointmentId)) {
+            return toSymptomResponse(symptomFormRepository.findByAppointmentId(appointmentId).get());
+        }
+
+        // LLM call — graceful fallback, never throws
         LlmService.PreVisitResult llm = llmService.generatePreVisitSummary(req.getSymptoms());
 
         SymptomForm form = SymptomForm.builder()
@@ -95,11 +93,11 @@ public class PatientService {
 
         form = symptomFormRepository.save(form);
 
-        // Move appointment to CONFIRMED now that symptoms are submitted
+        // Move to CONFIRMED
         appt.setStatus(Appointment.AppointmentStatus.CONFIRMED);
         appointmentRepository.save(appt);
 
-        log.info("Symptom form submitted for appointment {} [urgency={}]", appointmentId, llm.getUrgencyLevel());
+        log.info("Symptom form saved for appointment {} [urgency={}]", appointmentId, llm.getUrgencyLevel());
         return toSymptomResponse(form);
     }
 
@@ -112,7 +110,8 @@ public class PatientService {
             throw new UnauthorizedException("This appointment does not belong to you");
         }
         SymptomForm form = symptomFormRepository.findByAppointmentId(appointmentId)
-                .orElseThrow(() -> new ResourceNotFoundException("Symptom form not found for appointment " + appointmentId));
+                .orElseThrow(() -> new ResourceNotFoundException(
+                        "Symptom form not found for appointment " + appointmentId));
         return toSymptomResponse(form);
     }
 
