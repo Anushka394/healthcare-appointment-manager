@@ -18,7 +18,9 @@ export default function Register() {
     try {
       const data = await register(form);
       signIn(data);
-      navigate('/patient');
+      if (data.role === 'ADMIN') navigate('/admin');
+      else if (data.role === 'DOCTOR') navigate('/doctor');
+      else navigate('/patient');
     } catch (err) {
       setError(err.response?.data?.message || 'Registration failed.');
     } finally {
